@@ -194,8 +194,10 @@ threads. An exception raised by `fn` is raised again, for the first document
 where it happened; `fn` may then have been called on later documents, in
 other threads, and it must be safe to call from several threads at once.
 
-`map_many` scales best: each document is built, used and freed in the same
-thread, and only `fn`'s results come back. `loads_many` must return every
+The worker threads are started by the first call that needs them and kept
+for later calls (they wait, detached from the interpreter, between calls,
+and stop at exit). `map_many` scales best: each document is built, used and
+freed in the same thread, and only `fn`'s results come back. `loads_many` must return every
 document, and the Python objects of all of them, to the calling thread.
 With the GIL (the default build of Python), the calling thread does all the
 work: `threads` has no effect on speed.
@@ -444,15 +446,15 @@ disabled (see below), Intel Xeon Gold 6548N (64 cores); GB/s:
 
 | threads | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `map_many(len, data, threads=N)` | 0.91 | 1.77 | 3.28 | 6.22 | 10.9 | 15.4 | **21.2** |
-| `parse_many(data, threads=N)` | 1.82 | 3.06 | 4.80 | 6.90 | 10.2 | 12.3 | 16.4 |
-| `loads_many(data, threads=N)` | 0.82 | 1.43 | 2.26 | 3.88 | 5.77 | 7.45 | 8.63 |
+| `map_many(len, data, threads=N)` | 1.03 | 1.78 | 3.66 | 6.82 | 13.0 | 23.7 | **28.8** |
+| `parse_many(data, threads=N)` | 2.00 | 2.84 | 5.28 | 9.26 | 16.1 | 22.7 | 25.8 |
+| `loads_many(data, threads=N)` | 0.90 | 1.44 | 2.79 | 4.99 | 8.98 | 13.3 | 15.4 |
 
-`map_many` is 23 times faster on 64 threads than on one. `loads_many` builds
-every document for the calling thread and is 11 times faster. With the
-collector enabled, Python collects after the call returns: it examines the
-millions of objects just created, which takes about 0.1 s here, with or
-without threads.
+`map_many` is 28 times faster on 64 threads than on one (up to 38 GB/s when
+nothing else runs in the process). `loads_many` builds every document for
+the calling thread and is 17 times faster. With the collector enabled,
+Python collects after the call returns: it examines the millions of objects
+just created, which takes about 0.1 s here, with or without threads.
 
 ## Limitations
 

@@ -288,3 +288,65 @@ def test_threads_api():
 
     with pytest.raises(KeyError, match="boom"):
         fastsimdjson.map_many(boom, data, threads=4)
+
+
+# The worker threads of threads=N persist between calls (free-threaded
+# Python): they survive concurrent callers, a fork, and the end of the process.
+
+_POOL_DATA = b"\n".join(b'{"n": %d, "s": "%s"}' % (i, b"x" * (i % 50)) for i in range(40000))
+
+
+def test_threads_concurrent_callers():
+    import threading
+
+    expected = list(range(40000))
+    errors = []
+
+    def call():
+        for _ in range(5):
+            if fastsimdjson.map_many(lambda d: d["n"], _POOL_DATA, threads=8) != expected:
+                errors.append("mismatch")
+
+    ts = [threading.Thread(target=call) for _ in range(6)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert errors == []
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork")
+def test_threads_after_fork():
+    import subprocess
+    import sys
+
+    code = (
+        "import os, fastsimdjson as F\n"
+        "data = b'\\n'.join(b'{\"n\": %d, \"s\": \"%s\"}' % (i, b'x' * (i % 50)) for i in range(6000))\n"
+        "n = len(list(F.loads_many(data)))\n"
+        "assert len(F.loads_many(data, threads=4)) == n\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    os._exit(0 if len(F.loads_many(data, threads=4)) == n else 1)\n"
+        "_, status = os.waitpid(pid, 0)\n"
+        "assert os.waitstatus_to_exitcode(status) == 0\n"
+        "print('ok')\n"
+    )
+    r = subprocess.run([sys.executable, "-W", "ignore", "-c", code], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+
+
+def test_threads_exit_cleanly():
+    import subprocess
+    import sys
+
+    code = (
+        "import fastsimdjson as F, threading\n"
+        "data = b'\\n'.join(b'{\"n\": %d, \"s\": \"%s\"}' % (i, b'x' * (i % 50)) for i in range(6000))\n"
+        "F.map_many(len, data, threads=8)\n"
+        "t = threading.Thread(target=lambda: F.loads_many(data, threads=4), daemon=True)\n"
+        "t.start()\n"
+        "print('ok')\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr

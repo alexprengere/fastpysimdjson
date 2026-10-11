@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -67,6 +71,21 @@ inline int clz64(uint64_t x) { return __builtin_clzll(x); }
 // No longer declared in the public headers since 3.13, but still exported.
 extern "C" int _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key,
                                          PyObject *item, Py_hash_t hash);
+#endif
+
+#if defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030D0000
+// Without the GIL, _PyDict_SetItem_KnownHash locks the dict for each item.
+// The dicts that loads builds are new and seen by no other thread until
+// they are returned: they are filled without the lock.
+extern "C" int _PyDict_SetItem_KnownHash_LockHeld(PyDictObject *mp, PyObject *key,
+                                                  PyObject *item, Py_hash_t hash);
+inline int new_dict_set_item(PyObject *mp, PyObject *key, PyObject *item, Py_hash_t hash) {
+  return _PyDict_SetItem_KnownHash_LockHeld(reinterpret_cast<PyDictObject *>(mp), key, item, hash);
+}
+#else
+inline int new_dict_set_item(PyObject *mp, PyObject *key, PyObject *item, Py_hash_t hash) {
+  return _PyDict_SetItem_KnownHash(mp, key, item, hash);
+}
 #endif
 
 #ifdef _MSC_VER
@@ -149,6 +168,8 @@ struct ThreadParser {
   KeyCacheEntry value_cache[KEY_CACHE_SIZE]{};
   EncodedKey *encoded_keys = nullptr; // allocated on first use by dumpb
   bool cleanup_registered = false;    // see register_thread_cleanup
+  parser *chunk_parser = nullptr;     // for the chunks of parallel streams
+  bool chunk_parser_busy = false;
   void clear_encoded_keys() {
     if (encoded_keys != nullptr) {
       for (size_t i = 0; i < ENCODED_KEY_CACHE_SIZE; i++) {
@@ -161,6 +182,10 @@ struct ThreadParser {
   ~ThreadParser() {
     delete ptr;
     ptr = nullptr;
+    if (!chunk_parser_busy) {
+      delete chunk_parser;
+      chunk_parser = nullptr;
+    }
     delete spare;
     spare = nullptr;
     if (caches_can_decref()) {
@@ -176,6 +201,10 @@ thread_local ThreadParser g_thread_parser;
 void release_thread_state() {
   delete g_thread_parser.ptr;
   g_thread_parser.ptr = nullptr;
+  if (!g_thread_parser.chunk_parser_busy) {
+    delete g_thread_parser.chunk_parser;
+    g_thread_parser.chunk_parser = nullptr;
+  }
   delete g_thread_parser.spare;
   g_thread_parser.spare = nullptr;
   clear_cache(g_thread_parser.key_cache);
@@ -547,8 +576,7 @@ struct Builder {
         Py_DECREF(dict);
         return nullptr;
       }
-      int rc = _PyDict_SetItem_KnownHash(
-          dict, key, v, reinterpret_cast<PyASCIIObject *>(key)->hash);
+      int rc = new_dict_set_item(dict, key, v, reinterpret_cast<PyASCIIObject *>(key)->hash);
       Py_DECREF(key);
       Py_DECREF(v);
       if (rc < 0) {
@@ -761,6 +789,7 @@ PyTypeObject *IterType = nullptr;
 struct DocumentObject {
   PyObject_HEAD
   document *doc;
+  bool copied; // made by copy_document, freed by free_copy
 };
 
 // fastsimdjson.Object and fastsimdjson.Array.
@@ -972,9 +1001,16 @@ PyObject *at_pointer(DocumentObject *owner, size_t i, PyObject *arg) {
 
 // --- Document ---------------------------------------------------------------
 
+void free_copy(document *d);
+
 void document_dealloc(PyObject *self) {
   PyTypeObject *tp = Py_TYPE(self);
-  give_back(reinterpret_cast<DocumentObject *>(self)->doc);
+  DocumentObject *owner = reinterpret_cast<DocumentObject *>(self);
+  if (owner->copied) {
+    free_copy(owner->doc);
+  } else {
+    give_back(owner->doc);
+  }
   PyObject_Free(self);
   Py_DECREF(tp);
 }
@@ -1270,14 +1306,20 @@ PyType_Spec iter_spec = {
 
 // --- parse() ----------------------------------------------------------------
 
-// The root of document d, which the returned view takes over.
-PyObject *view_of(document *d) {
+// The root of document d, which the returned view takes over (d is a copy
+// from copy_document when `copied`).
+PyObject *view_of(document *d, bool copied = false) {
   DocumentObject *owner = PyObject_New(DocumentObject, DocumentType);
   if (owner == nullptr) {
-    give_back(d);
+    if (copied) {
+      free_copy(d);
+    } else {
+      give_back(d);
+    }
     return nullptr;
   }
   owner->doc = d;
+  owner->copied = copied;
   PyObject *root = value_at(owner, 1); // skip the root entry
   Py_DECREF(owner);
   return root;
@@ -3056,6 +3098,7 @@ struct StreamObject {
   size_t text_len; // bytes of buf that `text` covers (len, or more for a chunk)
   bool no_fallback;   // a chunk of a parallel run: do not call json (see run_chunk)
   bool need_fallback; // set instead of calling json, with no_fallback
+  bool borrowed_parser; // p is this thread's chunk parser (not deleted)
   parser *p;
   document_stream *stream;
   document_stream::iterator it;
@@ -3171,7 +3214,13 @@ bool stream_start(StreamObject *s, size_t at) {
   return true;
 }
 
-// A copy of the parser's current document, owning its own buffers.
+// A copy of the parser's current document, in one block from PyMem_Malloc
+// (on an attached thread): the document, then its tape, then its strings.
+// Streams on several threads make many of them at once, and the calling
+// thread frees them later: with glibc's malloc, the threads' heaps grew and
+// shrank at every call, and the system calls doing it are serialized.
+// PyMem_Malloc is mimalloc on free-threaded builds, without this problem.
+// The document's buffers are not its own: free_copy releases them first.
 document *copy_document(const document &src) {
   const uint64_t *tape = src.tape.get();
   // The root entry holds the index just past the last tape entry.
@@ -3188,19 +3237,29 @@ document *copy_document(const document &src) {
       i++;
     }
   }
-  document *d = new (std::nothrow) document();
-  if (d == nullptr) {
+  size_t head = (sizeof(document) + 63) & ~size_t(63);
+  size_t tape_bytes = n * sizeof(uint64_t);
+  char *block = static_cast<char *>(
+      PyMem_Malloc(head + tape_bytes + strings + simdjson::SIMDJSON_PADDING));
+  if (block == nullptr) {
     return nullptr;
   }
-  d->tape.reset(new (std::nothrow) uint64_t[n]);
-  d->string_buf.reset(new (std::nothrow) uint8_t[strings + simdjson::SIMDJSON_PADDING]());
-  if (!d->tape || !d->string_buf) {
-    delete d;
-    return nullptr;
-  }
-  memcpy(d->tape.get(), tape, n * sizeof(uint64_t));
-  memcpy(d->string_buf.get(), src.string_buf.get(), strings);
+  document *d = new (block) document();
+  uint64_t *t = reinterpret_cast<uint64_t *>(block + head);
+  uint8_t *str = reinterpret_cast<uint8_t *>(block + head + tape_bytes);
+  memcpy(t, tape, tape_bytes);
+  memcpy(str, src.string_buf.get(), strings);
+  memset(str + strings, 0, simdjson::SIMDJSON_PADDING);
+  d->tape.reset(t);
+  d->string_buf.reset(str);
   return d;
+}
+
+void free_copy(document *d) {
+  (void)d->tape.release(); // in the block, not allocated with new[]
+  (void)d->string_buf.release();
+  d->~document();
+  PyMem_Free(d);
 }
 
 PyObject *stream_value(StreamObject *s) {
@@ -3208,7 +3267,7 @@ PyObject *stream_value(StreamObject *s) {
     return build_with_gc_paused(s->p->doc, 1);
   }
   document *d = copy_document(s->p->doc);
-  return d == nullptr ? PyErr_NoMemory() : view_of(d);
+  return d == nullptr ? PyErr_NoMemory() : view_of(d, true);
 }
 
 // simdjson rejected the document after last_end. json decides, as in loads:
@@ -3320,7 +3379,11 @@ void stream_dealloc(PyObject *self) {
   PyTypeObject *tp = Py_TYPE(self);
   s->it.~iterator();
   delete s->stream;
-  delete s->p;
+  if (s->borrowed_parser) {
+    g_thread_parser.chunk_parser_busy = false;
+  } else {
+    delete s->p;
+  }
   delete s->copy;
   Py_XDECREF(s->source);
   Py_XDECREF(s->text);
@@ -3407,7 +3470,7 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   s->active = false;
   s->base = 0;
   s->last_end = 0;
-  s->no_fallback = s->need_fallback = false;
+  s->no_fallback = s->need_fallback = s->borrowed_parser = false;
   PyObject *self = reinterpret_cast<PyObject *>(s);
   if (must_copy) {
     PyObject *b = PyBytes_FromObject(data);
@@ -3481,8 +3544,9 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
 // called on documents after that point, in other threads.)
 // ---------------------------------------------------------------------------
 
-// A stream over [from, to) of the input of `whole`, sharing its buffer.
-StreamObject *stream_over(StreamObject *whole, size_t from, size_t to) {
+// A stream over [from, to) of the input of `whole`, sharing its buffer. A
+// chunk of a parallel run uses this thread's chunk parser when it is free.
+StreamObject *stream_over(StreamObject *whole, size_t from, size_t to, bool chunk = false) {
   StreamObject *s = PyObject_New(StreamObject, StreamType);
   if (s == nullptr) {
     return nullptr;
@@ -3506,14 +3570,29 @@ StreamObject *stream_over(StreamObject *whole, size_t from, size_t to) {
   s->prefix = whole->prefix;
   s->open = whole->open;
   s->close = whole->close;
-  s->no_fallback = s->need_fallback = false;
-  s->p = new (std::nothrow) parser();
+  s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  if (chunk && !g_thread_parser.chunk_parser_busy) {
+    if (g_thread_parser.chunk_parser == nullptr) {
+      register_thread_cleanup();
+      g_thread_parser.chunk_parser = new (std::nothrow) parser();
+    }
+    if (g_thread_parser.chunk_parser != nullptr) {
+      s->p = g_thread_parser.chunk_parser;
+      s->borrowed_parser = g_thread_parser.chunk_parser_busy = true;
+    }
+  }
+  if (s->p == nullptr) {
+    s->p = new (std::nothrow) parser();
+  }
   if (s->p == nullptr) {
     Py_DECREF(reinterpret_cast<PyObject *>(s));
     PyErr_NoMemory();
     return nullptr;
   }
   s->p->number_as_string(true);
+  // simdjson's streams run stage 1 of the next batch in a thread of their
+  // own; the threads of a parallel run already use all the cores.
+  s->p->threaded = !chunk;
   return s;
 }
 
@@ -3530,6 +3609,7 @@ struct ParallelRun {
   std::vector<Chunk> chunks;
   std::atomic<size_t> next{0};
   std::atomic<size_t> first_failure{SIZE_MAX};
+  size_t active = 0; // pool workers in work(), guarded by the pool's mutex
 
   void note_failure(size_t i) {
     size_t f = first_failure.load();
@@ -3541,7 +3621,7 @@ struct ParallelRun {
   void run_chunk(size_t i) {
     Chunk &c = chunks[i];
     c.resume_at = bounds[i];
-    StreamObject *st = stream_over(whole, bounds[i], bounds[i + 1]);
+    StreamObject *st = stream_over(whole, bounds[i], bounds[i + 1], true);
     c.items = st ? PyList_New(0) : nullptr;
     if (c.items == nullptr) {
       PyErr_Clear(); // the one-thread run will report it
@@ -3609,6 +3689,147 @@ struct ParallelRun {
   }
 };
 
+#ifdef Py_GIL_DISABLED
+// Worker threads for the parallel streams, started once and kept: starting
+// and ending threads (with their Python thread states) cost about as much
+// as the parsing on many cores. Idle workers are detached from Python and
+// wait for tasks: a task is a run to help with. A caller does the work of
+// its run too; at the end, it takes back the tasks that no worker started
+// and waits only for the workers that did start, so concurrent and nested
+// runs cannot deadlock.
+struct WorkerPool {
+  std::mutex mu;
+  std::condition_variable wake; // tasks, or stopping
+  std::condition_variable done; // a worker finished a task, or exited
+  std::deque<ParallelRun *> tasks;
+  PyInterpreterState *interp = nullptr;
+  size_t workers = 0;
+  size_t ready = 0; // workers with a thread state, waiting for tasks
+  size_t exited = 0;
+  bool stopping = false;
+};
+WorkerPool *g_pool = nullptr; // never freed: its threads may outlive anything
+std::mutex g_pool_mu;
+
+void pool_worker(WorkerPool *pool) {
+  PyThreadState *ts = PyThreadState_New(pool->interp);
+  {
+    std::lock_guard<std::mutex> lk(pool->mu);
+    pool->ready++;
+  }
+  pool->done.notify_all();
+  for (;;) {
+    ParallelRun *run;
+    {
+      std::unique_lock<std::mutex> lk(pool->mu);
+      pool->wake.wait(lk, [pool] { return pool->stopping || !pool->tasks.empty(); });
+      if (pool->tasks.empty()) {
+        break; // stopping
+      }
+      run = pool->tasks.front();
+      pool->tasks.pop_front();
+      run->active++;
+    }
+    if (ts != nullptr) {
+      PyEval_RestoreThread(ts);
+      run->work();
+      PyEval_SaveThread();
+    }
+    {
+      std::lock_guard<std::mutex> lk(pool->mu);
+      run->active--;
+    }
+    pool->done.notify_all();
+  }
+  if (ts != nullptr) {
+    PyEval_RestoreThread(ts);
+    PyThreadState_Clear(ts);
+    PyThreadState_DeleteCurrent();
+  }
+  {
+    std::lock_guard<std::mutex> lk(pool->mu);
+    pool->exited++;
+  }
+  pool->done.notify_all();
+}
+
+// The pool, with at least n workers (fewer if threads cannot be started).
+// New workers create their thread states before any work is handed out:
+// CPython may stop the world to make room for a thread state, which must
+// then wait for every attached thread, including busy workers. So the
+// caller waits, detached, for the new workers to be ready. (No lock is held
+// while a thread waits for others.)
+WorkerPool *get_pool(size_t n) {
+  WorkerPool *pool;
+  size_t target;
+  {
+    std::lock_guard<std::mutex> g(g_pool_mu);
+    PyInterpreterState *interp = PyInterpreterState_Get();
+    if (g_pool == nullptr) {
+      g_pool = new (std::nothrow) WorkerPool();
+      if (g_pool == nullptr) {
+        return nullptr;
+      }
+      g_pool->interp = interp;
+    }
+    pool = g_pool;
+    if (pool->interp != interp || pool->stopping) {
+      return nullptr; // another interpreter, or exiting: no helpers
+    }
+    while (pool->workers < std::min<size_t>(n, 1024)) {
+      try {
+        std::thread(pool_worker, pool).detach();
+      } catch (...) {
+        break;
+      }
+      std::lock_guard<std::mutex> lk(pool->mu);
+      pool->workers++;
+    }
+    target = pool->workers;
+  }
+  bool waiting;
+  {
+    std::lock_guard<std::mutex> lk(pool->mu);
+    waiting = pool->ready < target;
+  }
+  if (waiting) {
+    Py_BEGIN_ALLOW_THREADS
+    std::unique_lock<std::mutex> lk(pool->mu);
+    pool->done.wait(lk, [pool, target] { return pool->ready >= target; });
+    Py_END_ALLOW_THREADS
+  }
+  return pool;
+}
+
+// atexit: the workers delete their thread states while the interpreter is
+// still alive, then exit.
+PyObject *stop_pool(PyObject *, PyObject *) {
+  WorkerPool *pool;
+  {
+    std::lock_guard<std::mutex> g(g_pool_mu);
+    pool = g_pool;
+  }
+  if (pool != nullptr) {
+    Py_BEGIN_ALLOW_THREADS
+    std::unique_lock<std::mutex> lk(pool->mu);
+    pool->stopping = true;
+    pool->wake.notify_all();
+    pool->done.wait(lk, [pool] { return pool->exited == pool->workers; });
+    Py_END_ALLOW_THREADS
+  }
+  Py_RETURN_NONE;
+}
+
+#ifndef _WIN32
+// A forked child has none of the workers: forget the pool (and its mutexes,
+// which another thread may have held during the fork).
+void pool_after_fork() {
+  g_pool = nullptr;
+  new (&g_pool_mu) std::mutex();
+}
+#endif
+#endif
+
 // Chunk boundaries: about `n` chunks, each ending just after a newline (or
 // just before a record separator, for json_seq).
 std::vector<size_t> chunk_bounds(const StreamObject *w, size_t n) {
@@ -3647,30 +3868,26 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     run.chunks.resize(run.bounds.size() - 1);
     // Starting a thread costs about as much as building 512 KB of documents.
     size_t nthreads = std::min({threads, run.chunks.size(), std::max<size_t>(whole->len >> 19, 1)});
-    std::vector<std::thread> pool;
-    PyInterpreterState *interp = PyInterpreterState_Get();
-    for (size_t t = 1; t < nthreads; t++) {
-      try {
-        pool.emplace_back([&run, interp] {
-          PyThreadState *ts = PyThreadState_New(interp);
-          if (ts == nullptr) {
-            return;
-          }
-          PyEval_RestoreThread(ts);
-          run.work();
-          PyThreadState_Clear(ts);
-          PyThreadState_DeleteCurrent();
-        });
-      } catch (...) {
-        break; // fewer threads
+    WorkerPool *pool = nthreads > 1 ? get_pool(nthreads - 1) : nullptr;
+    if (pool != nullptr) {
+      {
+        std::lock_guard<std::mutex> lk(pool->mu);
+        for (size_t t = 1; t < nthreads; t++) {
+          pool->tasks.push_back(&run);
+        }
       }
+      pool->wake.notify_all();
     }
     run.work(); // the calling thread too
-    Py_BEGIN_ALLOW_THREADS
-    for (std::thread &t : pool) {
-      t.join();
+    if (pool != nullptr) {
+      Py_BEGIN_ALLOW_THREADS
+      std::unique_lock<std::mutex> lk(pool->mu);
+      for (auto it = pool->tasks.begin(); it != pool->tasks.end();) {
+        it = *it == &run ? pool->tasks.erase(it) : it + 1;
+      }
+      pool->done.wait(lk, [&run] { return run.active == 0; });
+      Py_END_ALLOW_THREADS
     }
-    Py_END_ALLOW_THREADS
     size_t f = run.first_failure.load();
     size_t total = 0;
     for (size_t i = 0; i < run.chunks.size() && i <= f; i++) {
@@ -3915,6 +4132,9 @@ PyMethodDef methods[] = {
     {"parse_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(parse_many)),
      METH_VARARGS | METH_KEYWORDS,
      "Iterate over the JSON documents of data lazily, like parse."},
+#ifdef Py_GIL_DISABLED
+    {"_stop_pool", stop_pool, METH_NOARGS, "Stop the worker threads (at exit)."},
+#endif
     {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
      METH_VARARGS | METH_KEYWORDS,
      "map_many(fn, data, *, format, batch_size, threads, lazy): the list of fn(doc) for the "
@@ -3941,6 +4161,26 @@ int register_abc(const char *name, PyTypeObject *type) {
 // Multi-phase init so the module can declare that it does not need the GIL.
 // Exception types are process-global, so subinterpreters stay unsupported.
 int exec_fastsimdjson(PyObject *module) {
+#ifdef Py_GIL_DISABLED
+  {
+    PyObject *atexit = PyImport_ImportModule("atexit");
+    PyObject *stop = atexit ? PyObject_GetAttrString(module, "_stop_pool") : nullptr;
+    PyObject *r = stop ? PyObject_CallMethod(atexit, "register", "O", stop) : nullptr;
+    Py_XDECREF(r);
+    Py_XDECREF(stop);
+    Py_XDECREF(atexit);
+    if (r == nullptr) {
+      return -1;
+    }
+#ifndef _WIN32
+    static bool atfork_done = false;
+    if (!atfork_done) {
+      pthread_atfork(nullptr, nullptr, pool_after_fork);
+      atfork_done = true;
+    }
+#endif
+  }
+#endif
 #if FSJ_AVX512
   has_avx512 = detect_avx512();
 #endif
