@@ -72,6 +72,9 @@ inline int clz64(uint64_t x) { return __builtin_clzll(x); }
 extern "C" int _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key,
                                          PyObject *item, Py_hash_t hash);
 #endif
+#if defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030E0000
+extern "C" void _Py_SetImmortal(PyObject *op); // exported, not declared
+#endif
 
 #if defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030D0000
 // Without the GIL, _PyDict_SetItem_KnownHash locks the dict for each item.
@@ -4259,6 +4262,16 @@ int exec_fastsimdjson(PyObject *module) {
       if (*t.type == nullptr) {
         return -1;
       }
+#if defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030E0000
+      // Each instance holds a reference to its heap type, released in its
+      // dealloc with Py_DECREF. CPython takes that reference with a
+      // per-thread count, but without the GIL, Py_DECREF is an atomic
+      // operation on the type, which all the threads making views contend
+      // for (views from 64 threads ran about 100 times slower than from
+      // one). Immortal types are not counted. The types are kept for the
+      // life of the process anyway (no subinterpreters).
+      _Py_SetImmortal(reinterpret_cast<PyObject *>(*t.type));
+#endif
     }
   }
   // isinstance(x, Mapping) / isinstance(x, Sequence) hold for the views.

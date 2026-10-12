@@ -350,3 +350,34 @@ def test_threads_exit_cleanly():
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+
+
+def test_map_many_lazy_views_kept():
+    # Views that fn keeps (whole or in part, or in an exception) remain valid
+    # after map_many, with or without threads.
+    data = b"\n".join(json.dumps({"n": i, "a": [i, {"b": str(i)}], "s": "x" * (i % 30)}).encode()
+                      for i in range(30000))
+    expected = [json.loads(x) for x in data.split(b"\n")]
+    for threads in (None, 1, 4):
+        kept = fastsimdjson.map_many(lambda v: v, data, threads=threads, lazy=True)
+        assert [to_py(v) for v in kept] == expected
+        parts = fastsimdjson.map_many(lambda v: v["a"][1], data, threads=threads, lazy=True)
+        assert [to_py(v) for v in parts] == [e["a"][1] for e in expected]
+        keys = fastsimdjson.map_many(lambda v: list(v.items()), data, threads=threads, lazy=True)
+        assert [[(k, to_py(x)) for k, x in kv] for kv in keys] == [list(e.items()) for e in expected]
+        some = []
+        out = fastsimdjson.map_many(lambda v: some.append(v) if v["n"] % 1000 == 0 else v["n"],
+                                    data, threads=threads, lazy=True)
+        # With threads, the appends happen in any order.
+        assert sorted((to_py(v) for v in some), key=lambda e: e["n"]) == \
+            [e for e in expected if e["n"] % 1000 == 0]
+        assert out == [None if e["n"] % 1000 == 0 else e["n"] for e in expected]
+
+        def boom(v):
+            if v["n"] == 20000:
+                raise ValueError(v)  # the exception keeps the view
+            return v["n"]
+
+        with pytest.raises(ValueError) as info:
+            fastsimdjson.map_many(boom, data, threads=threads, lazy=True)
+        assert to_py(info.value.args[0]) == expected[20000]
