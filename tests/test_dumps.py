@@ -435,3 +435,115 @@ def test_thread_exit_releases_caches():
     t.start()
     t.join()
     assert sys.getrefcount(key) == before
+
+
+# dumpb_many: each record as dumpb writes it, then a newline.
+
+def _lines(records, **kw):
+    return b"".join(fastsimdjson.dumpb(r, **kw) + b"\n" for r in records)
+
+
+def _error(fn):
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001
+        return type(e), str(e), type(e.__cause__)
+    return None
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_dumpb_many_random(seed):
+    rnd = random.Random(seed)
+    records = [random_value(rnd) for _ in range(rnd.randrange(1, 400))]
+    expected = _lines(records)
+    for threads in (None, 1, 4, 7):
+        kw = {} if threads is None else {"threads": threads}
+        assert fastsimdjson.dumpb_many(records, **kw) == expected
+        assert fastsimdjson.dumpb_many(tuple(records), **kw) == expected
+        assert fastsimdjson.dumpb_many(iter(records), **kw) == expected
+    # The output is NDJSON that reads back.
+    assert list(fastsimdjson.loads_many(expected, format="lines")) == \
+        [fastsimdjson.loads(fastsimdjson.dumpb(r)) for r in records]
+
+
+def test_dumpb_many_options():
+    records = [{"b": 1, "a": {1: 2}}, {"z": [3]}] * 50
+    for option in (4 | 32, 32):  # OPT_NON_STR_KEYS | OPT_SORT_KEYS; OPT_SORT_KEYS
+        expected = _error(lambda: _lines(records, option=option)) or _lines(records, option=option)
+        for threads in (1, 4):
+            got = _error(lambda: fastsimdjson.dumpb_many(records, option=option, threads=threads)) or \
+                fastsimdjson.dumpb_many(records, None, option, threads=threads)
+            assert got == expected
+    # One newline per record, with or without OPT_APPEND_NEWLINE.
+    assert fastsimdjson.dumpb_many([1, 2], option=fastsimdjson.OPT_APPEND_NEWLINE) == b"1\n2\n"
+    assert fastsimdjson.dumpb_many([]) == b""
+    assert fastsimdjson.dumpb_many([], threads=4) == b""
+    with pytest.raises(ValueError):
+        fastsimdjson.dumpb_many([1], option=fastsimdjson.OPT_INDENT_2)
+    with pytest.raises(TypeError, match="Invalid opts"):
+        fastsimdjson.dumpb_many([1], option="x")
+    with pytest.raises(TypeError):
+        fastsimdjson.dumpb_many(5)
+    with pytest.raises(TypeError):
+        fastsimdjson.dumpb_many()
+    with pytest.raises(ValueError):
+        fastsimdjson.dumpb_many([1], threads=-1)
+
+
+class _Thing:
+    def __init__(self, n):
+        self.n = n
+
+
+def test_dumpb_many_default_and_errors():
+    records = [{"i": i, "t": _Thing(i)} for i in range(3000)]
+
+    def default(o):
+        if isinstance(o, _Thing):
+            if o.n in (1700, 2500):
+                raise ValueError(f"bad {o.n}")
+            return o.n * 2
+        raise TypeError
+
+    good = records[:1700]
+    for threads in (None, 1, 4, 16):
+        kw = {} if threads is None else {"threads": threads}
+        assert fastsimdjson.dumpb_many(good, default=default, **kw) == _lines(good, default=default)
+        # The error of the first record that fails, as dumpb raises it (with
+        # default's exception as its cause).
+        got = _error(lambda: fastsimdjson.dumpb_many(records, default, **kw))
+        assert got == _error(lambda: fastsimdjson.dumpb(records[1700], default=default))
+        assert got[2] is ValueError
+        bad = [1, 2, {"x": object()}, 3, [object()]]
+        assert _error(lambda: fastsimdjson.dumpb_many(bad, **kw)) == \
+            _error(lambda: fastsimdjson.dumpb(bad[2]))
+
+
+def test_dumpb_many_under_mutation():
+    # Another thread changes the records while they are written: the output
+    # is still one valid document per record (free-threaded Python).
+    import threading
+
+    records = [{"i": i, "l": [i, "é", {"k": i}], "d": {"x": [1, 2]}} for i in range(3000)]
+    stop = threading.Event()
+
+    def mutate():
+        rnd = random.Random(0)
+        while not stop.is_set():
+            r = records[rnd.randrange(len(records))]
+            r["l"].append(rnd.random())
+            if len(r["l"]) > 6:
+                r["l"].clear()
+            r["d"] = {"y": "é" * rnd.randrange(4), "z": [None]}
+            r.pop("i", None) if rnd.random() < 0.5 else r.update(i=rnd.randrange(9))
+
+    t = threading.Thread(target=mutate)
+    t.start()
+    try:
+        for _ in range(20):
+            out = fastsimdjson.dumpb_many(records, threads=8)
+            docs = list(fastsimdjson.loads_many(out, format="lines"))
+            assert len(docs) == len(records)
+    finally:
+        stop.set()
+        t.join()

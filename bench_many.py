@@ -20,6 +20,10 @@ try:
     import msgspec
 except ImportError:
     msgspec = None
+try:
+    import jiter
+except ImportError:
+    jiter = None
 
 DATA = os.environ.get("JSONDIR", "simdjson-data/jsonexamples")
 
@@ -59,6 +63,11 @@ def main():
     }
     if orjson:
         methods["orjson.loads per line"] = lambda d: [orjson.loads(l) for l in d.splitlines() if l]
+    if jiter:
+        # jiter caches strings by default (cache_mode="all").
+        methods["jiter per line"] = lambda d: [jiter.from_json(l) for l in d.splitlines() if l]
+        methods["jiter per line (no cache)"] = lambda d: [jiter.from_json(l, cache_mode=False)
+                                                          for l in d.splitlines() if l]
     if msgspec:
         decoder = msgspec.json.Decoder()
         methods["msgspec decode per line"] = lambda d: [decoder.decode(l) for l in d.splitlines() if l]

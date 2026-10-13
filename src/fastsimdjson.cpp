@@ -12,6 +12,7 @@
 #include <new>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -2940,6 +2941,11 @@ struct OrjsonEncoder {
         }
       }
     } else {
+#ifdef Py_GIL_DISABLED
+      if (encode_items_locked(o, is_list) < 0) {
+        return -1;
+      }
+#else
       for (Py_ssize_t i = 0;; i++) {
         PyObject *item = is_list ? list_item(o, i)
                          : i < n ? Py_NewRef(PyTuple_GET_ITEM(o, i))
@@ -2954,6 +2960,7 @@ struct OrjsonEncoder {
           return -1;
         }
       }
+#endif
     }
     close(']');
     return 0;
@@ -3010,6 +3017,93 @@ struct OrjsonEncoder {
     return 0;
   }
 
+#ifdef Py_GIL_DISABLED
+  // Free-threaded Python: a dict or list is locked while its items are
+  // encoded, and the items are borrowed when that is safe. Taking references
+  // instead (a snapshot of the items) is slow on many threads: the records
+  // of a list often share their keys and short strings, and the threads then
+  // all update the same reference counts. Encoding an item that may lock
+  // another object or run Python code can suspend the lock (another thread
+  // may then change the container), so such an item is referenced first:
+  // anything but an exact int, float, ASCII str, None, True or False.
+  static bool borrowable(PyObject *v) {
+    PyTypeObject *t = Py_TYPE(v);
+    return (t == &PyUnicode_Type && PyUnicode_IS_COMPACT_ASCII(v)) || t == &PyLong_Type ||
+           t == &PyFloat_Type || v == Py_None || v == Py_True || v == Py_False;
+  }
+
+  // References released when they go out of scope, also when the output
+  // buffer throws std::bad_alloc.
+  struct Refs {
+    PyObject *a, *b;
+    ~Refs() {
+      Py_XDECREF(a);
+      Py_XDECREF(b);
+    }
+  };
+
+  // The lock is released before std::bad_alloc goes further.
+  FSJ_NOINLINE int encode_entries_locked(PyObject *o) {
+    int rc = 0;
+    bool oom = false;
+    Py_BEGIN_CRITICAL_SECTION(o);
+    try {
+      Py_ssize_t pos = 0;
+      PyObject *key, *value;
+      bool first = true;
+      while (rc == 0 && PyDict_Next(o, &pos, &key, &value)) {
+        if (borrowable(key) && borrowable(value)) {
+          rc = encode_entry(key, value, first);
+        } else {
+          Refs r{Py_NewRef(key), Py_NewRef(value)};
+          rc = encode_entry(key, value, first);
+        }
+        first = false;
+      }
+    } catch (const std::bad_alloc &) {
+      oom = true;
+    }
+    Py_END_CRITICAL_SECTION();
+    if (oom) {
+      throw std::bad_alloc();
+    }
+    return rc;
+  }
+
+  // A tuple cannot change: its items live as long as it does.
+  FSJ_NOINLINE int encode_items_locked(PyObject *o, bool is_list) {
+    int rc = 0;
+    if (!is_list) {
+      for (Py_ssize_t i = 0; rc == 0 && i < PyTuple_GET_SIZE(o); i++) {
+        separate(i == 0);
+        rc = encode(PyTuple_GET_ITEM(o, i));
+      }
+      return rc;
+    }
+    bool oom = false;
+    Py_BEGIN_CRITICAL_SECTION(o);
+    try {
+      for (Py_ssize_t i = 0; rc == 0 && i < PyList_GET_SIZE(o); i++) {
+        PyObject *item = PyList_GET_ITEM(o, i);
+        separate(i == 0);
+        if (borrowable(item)) {
+          rc = encode(item);
+        } else {
+          Refs r{Py_NewRef(item), nullptr};
+          rc = encode(item);
+        }
+      }
+    } catch (const std::bad_alloc &) {
+      oom = true;
+    }
+    Py_END_CRITICAL_SECTION();
+    if (oom) {
+      throw std::bad_alloc();
+    }
+    return rc;
+  }
+#endif
+
   // Dict subclasses as dicts (their items, as stored), as with orjson.
   FSJ_NOINLINE int encode_dict(PyObject *o) {
     if (depth >= ORJSON_MAX_DEPTH) { // empty containers count too
@@ -3027,6 +3121,15 @@ struct OrjsonEncoder {
       keys = g_thread_parser.encoded_keys = new (std::nothrow) EncodedKey[ENCODED_KEY_CACHE_SIZE];
     }
     int rc = 0;
+#ifdef Py_GIL_DISABLED
+    if (!(opts & (OPT_NON_STR_KEYS | OPT_SORT_KEYS))) {
+      rc = encode_entries_locked(o);
+      if (rc == 0) {
+        close('}');
+      }
+      return rc;
+    }
+#endif
     // Without borrowed (Python code may run, or another thread), a snapshot
     // holds the keys and values.
     PyObject *items = borrowed ? nullptr : PyDict_Items(o);
@@ -3168,6 +3271,27 @@ struct OrjsonEncoder {
   }
 };
 
+// The flags of option= (None, or an int of orjson's OPT_* flags), as
+// orjson.dumps checks them.
+bool orjson_options(PyObject *option, unsigned long *opts) {
+  *opts = 0;
+  if (option == nullptr || option == Py_None) {
+    return true;
+  }
+  if (!PyLong_Check(option)) {
+    PyErr_SetString(PyExc_TypeError, "Invalid opts");
+    return false;
+  }
+  long v = PyLong_AsLong(option);
+  if ((v == -1 && PyErr_Occurred()) || v < 0 || (unsigned long)v > OPT_ALL) {
+    PyErr_Clear();
+    PyErr_SetString(PyExc_TypeError, "Invalid opts");
+    return false;
+  }
+  *opts = (unsigned long)v;
+  return true;
+}
+
 // dumpb(obj, /, default=None, option=None), as orjson.dumps.
 PyObject *dumpb(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
   PyObject *obj = nullptr, *dflt = nullptr, *option = nullptr;
@@ -3196,18 +3320,8 @@ PyObject *dumpb(PyObject *, PyObject *const *args, Py_ssize_t nargs, PyObject *k
     // fails, and becomes the __cause__ of the error.
     e.default_fn = dflt;
   }
-  if (option != nullptr && option != Py_None) {
-    if (!PyLong_Check(option)) {
-      PyErr_SetString(PyExc_TypeError, "Invalid opts");
-      return nullptr;
-    }
-    long v = PyLong_AsLong(option);
-    if ((v == -1 && PyErr_Occurred()) || v < 0 || (unsigned long)v > OPT_ALL) {
-      PyErr_Clear();
-      PyErr_SetString(PyExc_TypeError, "Invalid opts");
-      return nullptr;
-    }
-    e.opts = (unsigned long)v;
+  if (!orjson_options(option, &e.opts)) {
+    return nullptr;
   }
   int rc;
   try {
@@ -3848,7 +3962,16 @@ StreamObject *stream_over(StreamObject *whole, size_t from, size_t to, bool chun
   return s;
 }
 
-struct ParallelRun {
+// Work that pool workers can help with: work() takes pieces of it until
+// none is left. active counts the workers inside work(), guarded by the
+// pool's mutex.
+struct PoolTask {
+  size_t active = 0;
+  virtual void work() = 0;
+  virtual ~PoolTask() = default;
+};
+
+struct ParallelRun : PoolTask {
   StreamObject *whole;
   PyObject *fn; // borrowed, or nullptr
   std::vector<size_t> bounds; // chunk i is [bounds[i], bounds[i + 1])
@@ -3861,7 +3984,6 @@ struct ParallelRun {
   std::vector<Chunk> chunks;
   std::atomic<size_t> next{0};
   std::atomic<size_t> first_failure{SIZE_MAX};
-  size_t active = 0; // pool workers in work(), guarded by the pool's mutex
 
   void note_failure(size_t i) {
     size_t f = first_failure.load();
@@ -3928,7 +4050,7 @@ struct ParallelRun {
 
   // Takes chunks until none is left, letting the garbage collector of
   // other threads run between chunks.
-  void work() {
+  void work() override {
     for (;;) {
       size_t i = next.fetch_add(1);
       if (i >= chunks.size() || i > first_failure.load()) {
@@ -3953,7 +4075,7 @@ struct WorkerPool {
   std::mutex mu;
   std::condition_variable wake; // tasks, or stopping
   std::condition_variable done; // a worker finished a task, or exited
-  std::deque<ParallelRun *> tasks;
+  std::deque<PoolTask *> tasks;
   PyInterpreterState *interp = nullptr;
   size_t workers = 0;
   size_t ready = 0; // workers with a thread state, waiting for tasks
@@ -3971,7 +4093,7 @@ void pool_worker(WorkerPool *pool) {
   }
   pool->done.notify_all();
   for (;;) {
-    ParallelRun *run;
+    PoolTask *run;
     {
       std::unique_lock<std::mutex> lk(pool->mu);
       pool->wake.wait(lk, [pool] { return pool->stopping || !pool->tasks.empty(); });
@@ -4072,6 +4194,31 @@ PyObject *stop_pool(PyObject *, PyObject *) {
   Py_RETURN_NONE;
 }
 
+// Runs task->work() in the calling thread, helped by up to nthreads - 1
+// pool workers; returns when the task is done.
+void run_on_pool(PoolTask *task, size_t nthreads) {
+  WorkerPool *pool = nthreads > 1 ? get_pool(nthreads - 1) : nullptr;
+  if (pool != nullptr) {
+    {
+      std::lock_guard<std::mutex> lk(pool->mu);
+      for (size_t t = 1; t < nthreads; t++) {
+        pool->tasks.push_back(task);
+      }
+    }
+    pool->wake.notify_all();
+  }
+  task->work(); // the calling thread too
+  if (pool != nullptr) {
+    Py_BEGIN_ALLOW_THREADS
+    std::unique_lock<std::mutex> lk(pool->mu);
+    for (auto it = pool->tasks.begin(); it != pool->tasks.end();) {
+      it = *it == task ? pool->tasks.erase(it) : it + 1;
+    }
+    pool->done.wait(lk, [task] { return task->active == 0; });
+    Py_END_ALLOW_THREADS
+  }
+}
+
 #ifndef _WIN32
 // A forked child has none of the workers: forget the pool (and its mutexes,
 // which another thread may have held during the fork).
@@ -4120,26 +4267,7 @@ PyObject *run_stream(StreamObject *whole, PyObject *fn, size_t threads) {
     run.chunks.resize(run.bounds.size() - 1);
     // Starting a thread costs about as much as building 512 KB of documents.
     size_t nthreads = std::min({threads, run.chunks.size(), std::max<size_t>(whole->len >> 19, 1)});
-    WorkerPool *pool = nthreads > 1 ? get_pool(nthreads - 1) : nullptr;
-    if (pool != nullptr) {
-      {
-        std::lock_guard<std::mutex> lk(pool->mu);
-        for (size_t t = 1; t < nthreads; t++) {
-          pool->tasks.push_back(&run);
-        }
-      }
-      pool->wake.notify_all();
-    }
-    run.work(); // the calling thread too
-    if (pool != nullptr) {
-      Py_BEGIN_ALLOW_THREADS
-      std::unique_lock<std::mutex> lk(pool->mu);
-      for (auto it = pool->tasks.begin(); it != pool->tasks.end();) {
-        it = *it == &run ? pool->tasks.erase(it) : it + 1;
-      }
-      pool->done.wait(lk, [&run] { return run.active == 0; });
-      Py_END_ALLOW_THREADS
-    }
+    run_on_pool(&run, nthreads);
     size_t f = run.first_failure.load();
     size_t total = 0;
     for (size_t i = 0; i < run.chunks.size() && i <= f; i++) {
@@ -4387,6 +4515,213 @@ PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// dumpb_many(records, /, default=None, option=None, *, threads=None): the
+// records as NDJSON, each as dumpb writes it, followed by a newline. With
+// threads (free-threaded Python), chunks of records are encoded at once.
+// ---------------------------------------------------------------------------
+
+// Encodes items [a, b) into e.out, one per line. Returns b, or the index of
+// the record that failed, with the exception set.
+size_t encode_lines(OrjsonEncoder &e, PyObject *const *items, size_t a, size_t b) {
+  for (size_t i = a; i < b; i++) {
+    size_t mark = e.out.len;
+    e.depth = e.default_calls = 0;
+#ifndef Py_GIL_DISABLED
+    e.borrowed = true;
+#endif
+    int rc = e.encode(items[i]);
+    if (rc < 0 && e.restart) { // Python code may run: again, without borrowing
+      e.borrowed = e.restart = false;
+      e.out.len = mark;
+      e.depth = e.default_calls = 0;
+      rc = e.encode(items[i]);
+    }
+    if (rc < 0) {
+      return i;
+    }
+    e.out.push_back('\n');
+  }
+  return b;
+}
+
+#ifdef Py_GIL_DISABLED
+struct DumpRun : PoolTask {
+  PyObject *const *items;
+  PyObject *dflt; // borrowed, or nullptr
+  unsigned long opts;
+  std::vector<size_t> bounds; // chunk i is items [bounds[i], bounds[i + 1])
+  struct Chunk {
+    std::unique_ptr<OrjsonEncoder> e; // its output
+    PyObject *type = nullptr, *value = nullptr, *tb = nullptr; // its error
+  };
+  std::vector<Chunk> chunks;
+  std::atomic<size_t> next{0};
+  std::atomic<size_t> first_failure{SIZE_MAX};
+  // Output of the chunks done so far, to size the buffers of the next ones
+  // (growing a buffer copies it).
+  std::atomic<size_t> done_bytes{0};
+  std::atomic<size_t> done_records{0};
+
+  // On an attached thread.
+  void run_chunk(size_t i) {
+    Chunk &c = chunks[i];
+    bool failed;
+    try {
+      c.e.reset(new OrjsonEncoder()); // uses this thread's key cache
+      c.e->default_fn = dflt;
+      c.e->opts = opts;
+      size_t records = bounds[i + 1] - bounds[i];
+      size_t seen = done_records.load(std::memory_order_relaxed);
+      if (seen > 0) {
+        size_t per_record = done_bytes.load(std::memory_order_relaxed) / seen + 1;
+        c.e->out.reserve(per_record * records + per_record * records / 8);
+      }
+      failed = encode_lines(*c.e, items, bounds[i], bounds[i + 1]) < bounds[i + 1];
+      if (!failed) {
+        done_bytes.fetch_add(c.e->out.len, std::memory_order_relaxed);
+        done_records.fetch_add(records, std::memory_order_relaxed);
+      }
+    } catch (const std::bad_alloc &) {
+      PyErr_NoMemory();
+      failed = true;
+    }
+    if (failed) {
+      PyErr_Fetch(&c.type, &c.value, &c.tb);
+      size_t f = first_failure.load();
+      while (i < f && !first_failure.compare_exchange_weak(f, i)) {
+      }
+    }
+  }
+
+  void work() override {
+    for (;;) {
+      size_t i = next.fetch_add(1);
+      if (i >= chunks.size() || i > first_failure.load()) {
+        return;
+      }
+      run_chunk(i);
+      Py_BEGIN_ALLOW_THREADS
+      Py_END_ALLOW_THREADS
+    }
+  }
+};
+
+// Copies the output of each chunk into place, on several threads too (one
+// thread copies about 10 GB/s).
+struct CopyRun : PoolTask {
+  DumpRun *run;
+  char *dst;
+  std::vector<size_t> offsets;
+  std::atomic<size_t> next{0};
+
+  void work() override {
+    for (;;) {
+      size_t i = next.fetch_add(1);
+      if (i >= run->chunks.size()) {
+        return;
+      }
+      const OutBuf &o = run->chunks[i].e->out;
+      memcpy(dst + offsets[i], o.buf, o.len);
+    }
+  }
+};
+
+// The records on several threads, or nullptr with an exception.
+PyObject *dumpb_many_threads(PyObject *const *items, size_t n, PyObject *dflt,
+                             unsigned long opts, size_t threads) {
+  DumpRun run;
+  run.items = items;
+  run.dflt = dflt;
+  run.opts = opts;
+  size_t nchunks = std::min(threads * 8, n);
+  for (size_t k = 0; k <= nchunks; k++) {
+    run.bounds.push_back(n * k / nchunks);
+  }
+  run.chunks.resize(nchunks);
+  run_on_pool(&run, std::min(threads, nchunks));
+  size_t f = run.first_failure.load();
+  PyObject *result = nullptr;
+  if (f == SIZE_MAX) {
+    CopyRun copy;
+    copy.run = &run;
+    size_t total = 0;
+    for (auto &c : run.chunks) {
+      copy.offsets.push_back(total);
+      total += c.e->out.len;
+    }
+    result = PyBytes_FromStringAndSize(nullptr, Py_ssize_t(total));
+    if (result != nullptr) {
+      copy.dst = PyBytes_AS_STRING(result);
+      run_on_pool(&copy, std::min(threads, nchunks));
+    }
+  }
+  // The error of the first record that failed, as without threads.
+  for (size_t i = 0; i < run.chunks.size(); i++) {
+    DumpRun::Chunk &c = run.chunks[i];
+    if (i == f) {
+      PyErr_Restore(c.type, c.value, c.tb);
+    } else {
+      Py_XDECREF(c.type);
+      Py_XDECREF(c.value);
+      Py_XDECREF(c.tb);
+    }
+  }
+  return result;
+}
+#endif
+
+PyObject *dumpb_many(PyObject *, PyObject *args, PyObject *kwargs) {
+  Py_ssize_t threads;
+  bool given;
+  PyObject *rest = take_threads(kwargs, &threads, &given);
+  if (rest == nullptr && PyErr_Occurred()) {
+    return nullptr;
+  }
+  static const char *kwlist[] = {"", "default", "option", nullptr};
+  PyObject *records, *dflt = nullptr, *option = nullptr;
+  int ok = PyArg_ParseTupleAndKeywords(args, rest, "O|OO:dumpb_many",
+                                       const_cast<char **>(kwlist), &records, &dflt, &option);
+  Py_XDECREF(rest);
+  unsigned long opts;
+  if (!ok || !orjson_options(option, &opts)) {
+    return nullptr;
+  }
+  if (opts & OPT_INDENT_2) {
+    PyErr_SetString(PyExc_ValueError, "dumpb_many writes one record per line: OPT_INDENT_2 is not supported");
+    return nullptr;
+  }
+  // A snapshot of the records (a list could change while we encode it).
+  PyObject *tuple = PySequence_Tuple(records);
+  if (tuple == nullptr) {
+    return nullptr;
+  }
+  PyObject *const *items = &PyTuple_GET_ITEM(tuple, 0);
+  size_t n = size_t(PyTuple_GET_SIZE(tuple));
+  PyObject *result = nullptr;
+#ifdef Py_GIL_DISABLED
+  if (given && threads > 1 && n > 1) {
+    result = dumpb_many_threads(items, n, dflt, opts, size_t(threads));
+    Py_DECREF(tuple);
+    return result;
+  }
+#else
+  (void)given;
+#endif
+  OrjsonEncoder e;
+  e.default_fn = dflt;
+  e.opts = opts;
+  try {
+    if (encode_lines(e, items, 0, n) == n) {
+      result = e.out.take_bytes();
+    }
+  } catch (const std::bad_alloc &) {
+    PyErr_NoMemory();
+  }
+  Py_DECREF(tuple);
+  return result;
+}
+
 // Benchmarking helper: run simdjson without building Python objects.
 PyObject *parse_only(PyObject *, PyObject *arg) {
   if (!PyBytes_Check(arg)) {
@@ -4433,9 +4768,15 @@ PyMethodDef methods[] = {
 #ifdef Py_GIL_DISABLED
     {"_stop_pool", stop_pool, METH_NOARGS, "Stop the worker threads (at exit)."},
 #endif
+    {"dumpb_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(dumpb_many)),
+     METH_VARARGS | METH_KEYWORDS,
+     "dumpb_many(records, /, default=None, option=None, *, threads=None)\n--\n\n"
+     "The records as NDJSON bytes: each as dumpb writes it, then a newline.\n"
+     "With threads (free-threaded Python), the records are encoded on several threads."},
     {"map_many", reinterpret_cast<PyCFunction>(reinterpret_cast<void (*)(void)>(map_many)),
      METH_VARARGS | METH_KEYWORDS,
-     "map_many(fn, data, *, format, batch_size, threads, lazy): the list of fn(doc) for the "
+     "map_many(fn, data, *, format, batch_size, threads, lazy, fields, default): the list of "
+     "fn(doc) for the "
      "documents of data, with fn called in the threads."},
     {"parse", parse, METH_O,
      "Parse JSON lazily: objects and arrays are returned as read-only views "

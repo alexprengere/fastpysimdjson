@@ -10,7 +10,8 @@ function is faster still. It also reads streams of documents (NDJSON, JSON
 Lines), on many threads with free-threaded Python, and can extract only the
 fields you need from each document. It writes JSON in two ways: `dumps` returns the same `str` as
 `json.dumps`, and `dumpb` returns the same `bytes` as `orjson.dumps`, as fast
-as orjson.
+as orjson; `dumpb_many` writes NDJSON, on many threads with free-threaded
+Python.
 
 With pip:
 
@@ -125,6 +126,30 @@ serialize dataclasses, `datetime`, `date`, `time`, `UUID`, numpy arrays or
 `orjson.Fragment` itself: they go to `default`, as if
 `OPT_PASSTHROUGH_DATACLASS` and `OPT_PASSTHROUGH_DATETIME` were set, and the
 options that concern only these types are accepted and have no effect.
+
+### `dumpb_many`: NDJSON, on several threads
+
+```python
+data = fastsimdjson.dumpb_many(records)               # b'{...}\n{...}\n'
+data = fastsimdjson.dumpb_many(records, threads=16)   # free-threaded Python
+```
+
+`dumpb_many(records, default=None, option=None, *, threads=None)` returns
+the records (a list, a tuple or any iterable) as NDJSON `bytes`: each record
+as `dumpb` writes it, followed by a newline, so that the output reads back
+with `loads_many(data, format="lines")`. `default` and `option` are those of
+`dumpb`, except `OPT_INDENT_2`, which would spread a record over several
+lines (`ValueError`); `OPT_APPEND_NEWLINE` changes nothing.
+
+On free-threaded Python, `threads=N` writes chunks of records on N threads at
+once (`threads=0` or `None`: one per processor), with the worker threads of
+`map_many`. The output and the errors are those of one thread: when records
+cannot be serialized, the error of the first of them is raised (`default` may
+then have been called on later records, in other threads, and it must be
+safe to call from several threads at once). With the GIL, the calling thread
+does all the work. Like `dumpb`, `dumpb_many` does not crash when other
+threads change the records meanwhile, but the output then reflects some of
+the changes and not others.
 
 ### Files
 
@@ -348,7 +373,7 @@ geometric mean over the 22 files (higher is better).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads.png" width="80%" alt="Parsing JSON in Python: fastsimdjson loads 0.78 GB/s, orjson 0.60, msgspec 0.53, jiter 0.48, pysimdjson 0.44, cysimdjson 0.43, ujson 0.37, python-rapidjson 0.24, simplejson 0.23, json 0.22">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads.png" width="80%" alt="Parsing JSON in Python: fastsimdjson loads 0.78 GB/s, orjson 0.60, msgspec 0.53, jiter 0.48, jiter without its string cache 0.44, pysimdjson 0.44, cysimdjson 0.43, ujson 0.37, python-rapidjson 0.24, simplejson 0.23, json 0.22">
 </picture>
 
 | parser | GB/s | vs `json.loads` |
@@ -359,7 +384,8 @@ geometric mean over the 22 files (higher is better).
 | ujson 6.0.0 | 0.37 | 1.66× |
 | cysimdjson 26.27 | 0.43 | 1.96× |
 | pysimdjson 7.0.2 | 0.44 | 1.98× |
-| jiter 0.17.0 | 0.48 | 2.21× |
+| jiter 0.17.0 (no string cache) | 0.44 | 2.00× |
+| jiter 0.17.0 (string cache, the default) | 0.48 | 2.21× |
 | msgspec 0.22.0 | 0.53 | 2.42× |
 | orjson 3.12.0 | 0.60 | 2.74× |
 | **fastsimdjson `loads`** | **0.78** | **3.53×** |
@@ -375,7 +401,7 @@ the collector enabled and 1.22× with it disabled (geometric means); without
 the collector, `canada.json`, `mesh.json` and `numbers.json` are ties. yyjson 4.0.6 is left out: it
 returns wrong strings for non-ASCII text. jiter (the parser of pydantic)
 caches strings by default; turning the cache off (`cache_mode=False`) makes it
-slower here (0.44 GB/s).
+slower here.
 
 Parsing is no longer the bottleneck. simdjson alone parses these files at
 3.1 GB/s. It accounts for about a third of the time of `loads`; the rest goes
@@ -390,12 +416,14 @@ and the screen name of the 100 statuses of `twitter.json`:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_parse_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_parse.png" width="80%" alt="Reading part of twitter.json: fastsimdjson parse 158 µs, pysimdjson 179, cysimdjson 229, msgspec 336, fastsimdjson loads 861, orjson 1009, json 3922">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_parse.png" width="80%" alt="Reading part of twitter.json: fastsimdjson parse 158 µs, pysimdjson 179, cysimdjson 229, msgspec 336, fastsimdjson loads 861, orjson 1009, jiter 1281, jiter without its string cache 1592, json 3922">
 </picture>
 
 | method | µs |
 |---|---:|
 | `json.loads` | 3922 |
+| jiter (no string cache) | 1592 |
+| jiter (string cache) | 1281 |
 | orjson | 1009 |
 | fastsimdjson `loads` | 861 |
 | msgspec (typed `Struct`) | 336 |
@@ -449,6 +477,18 @@ times faster than msgspec and 10 times faster than `json`. The comparison was
 run on a processor with AVX-512, which `dumpb` and orjson both use to escape
 strings; other x64 processors use SSE2 and ARM processors NEON.
 
+### Writing NDJSON with `dumpb_many`
+
+The 593,945 events of two hours of [GH Archive](https://www.gharchive.org/)
+(1.87 GB of NDJSON), written back as NDJSON from Python objects. With the
+GIL (Python 3.14.6), one thread: `orjson.dumps` on each record, joined, runs
+at 0.94 GB/s, `dumpb` on each record at 1.07 GB/s, and `dumpb_many` at
+1.41 GB/s. On free-threaded Python 3.14.6t, GB/s:
+
+| threads | 1 | 8 | 32 | 64 |
+|---|---:|---:|---:|---:|
+| `dumpb_many(records, threads=N)` | 1.3 | 6.0 | 11 | 12 |
+
 ### Streams with `loads_many`
 
 20 MB of NDJSON (5268 objects and arrays, one per line), made from the same
@@ -456,12 +496,14 @@ files; best of three runs:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_ndjson_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_ndjson.png" width="80%" alt="Reading NDJSON: fastsimdjson parse_many 0.94 GB/s, loads_many 0.38, msgspec decode_lines 0.37, fastsimdjson loads per line 0.33, msgspec decode per line 0.27, orjson per line 0.26, json per line 0.12">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_ndjson.png" width="80%" alt="Reading NDJSON: fastsimdjson parse_many 0.94 GB/s, loads_many 0.38, msgspec decode_lines 0.37, fastsimdjson loads per line 0.33, msgspec decode per line 0.27, orjson per line 0.26, jiter per line 0.22, jiter without its string cache per line 0.20, json per line 0.12">
 </picture>
 
 | method | ms | GB/s |
 |---|---:|---:|
 | `json.loads` on each line | 169 | 0.12 |
+| jiter on each line (no string cache) | 98 | 0.20 |
+| jiter on each line (string cache) | 90 | 0.22 |
 | orjson on each line | 77 | 0.26 |
 | msgspec `decode` on each line | 74 | 0.27 |
 | fastsimdjson `loads` on each line | 60 | 0.33 |
