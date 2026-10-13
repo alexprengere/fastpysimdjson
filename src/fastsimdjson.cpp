@@ -892,11 +892,10 @@ PyObject *value_at(DocumentObject *owner, size_t i) {
   }
 }
 
-// Tape index of the value of the first field named key, or 0.
-size_t find_key(DocumentObject *owner, size_t start, const char *key,
-                size_t len) {
-  const uint64_t *tape = tape_of(owner);
-  const uint8_t *strings = owner->doc->string_buf.get();
+// Tape index of the value of the first field named key in the object at
+// start, or 0.
+size_t find_key_in(const uint64_t *tape, const uint8_t *strings, size_t start,
+                   const char *key, size_t len) {
   size_t end = close_of(tape, start);
   for (size_t i = start + 1; i < end; i = skip(tape, i + 1)) {
     size_t idx = size_t(tape[i] & simdjson::internal::JSON_VALUE_MASK);
@@ -907,6 +906,11 @@ size_t find_key(DocumentObject *owner, size_t start, const char *key,
     }
   }
   return 0;
+}
+
+size_t find_key(DocumentObject *owner, size_t start, const char *key,
+                size_t len) {
+  return find_key_in(tape_of(owner), owner->doc->string_buf.get(), start, key, len);
 }
 
 // Tape index of element k of an array, starting from element j at tape
@@ -1000,6 +1004,234 @@ PyObject *at_pointer(DocumentObject *owner, size_t i, PyObject *arg) {
     }
   }
   return value_at(owner, i);
+}
+
+// --- fields= ------------------------------------------------------------------
+// loads_many(data, fields=...) and map_many(fn, data, fields=...): instead of
+// each document, the values at some JSON Pointers, found on the tape. Only
+// these values become Python objects.
+
+struct FieldStep {
+  std::string key;
+  size_t index;    // the token as an array index, or SIZE_MAX
+  PyObject *name;  // the token as a str (documents that json decoded)
+};
+
+struct Fields {
+  std::vector<std::vector<FieldStep>> paths;
+  std::vector<size_t> shared; // leading steps in common with the previous path
+  size_t depth = 0;           // steps of the longest path
+  bool single = false;        // fields was one str: the value, not a tuple
+  PyObject *dflt = nullptr;   // the value of a missing field
+
+  ~Fields() {
+    for (auto &p : paths) {
+      for (auto &s : p) {
+        Py_XDECREF(s.name);
+      }
+    }
+    Py_XDECREF(dflt);
+  }
+};
+
+// Appends the steps of the JSON Pointer `arg` to `path`.
+bool compile_pointer(PyObject *arg, std::vector<FieldStep> &path) {
+  Py_ssize_t plen;
+  const char *p = PyUnicode_Check(arg) ? PyUnicode_AsUTF8AndSize(arg, &plen) : nullptr;
+  if (p == nullptr) {
+    if (!PyErr_Occurred()) {
+      PyErr_Format(PyExc_TypeError, "fields must be JSON pointers (str), not %.200s",
+                   Py_TYPE(arg)->tp_name);
+    }
+    return false;
+  }
+  if (plen > 0 && p[0] != '/') {
+    PyErr_Format(PyExc_ValueError, "invalid JSON pointer: %R", arg);
+    return false;
+  }
+  const char *end = p + plen;
+  for (const char *cur = p; cur < end;) {
+    cur++; // '/'
+    const char *stop = static_cast<const char *>(memchr(cur, '/', size_t(end - cur)));
+    if (stop == nullptr) {
+      stop = end;
+    }
+    std::string token(cur, size_t(stop - cur));
+    cur = stop;
+    for (size_t t = token.find('~'); t != std::string::npos; t = token.find('~', t + 1)) {
+      if (t + 1 >= token.size() || (token[t + 1] != '0' && token[t + 1] != '1')) {
+        PyErr_Format(PyExc_ValueError, "invalid JSON pointer: %R", arg);
+        return false;
+      }
+      token.replace(t, 2, token[t + 1] == '0' ? "~" : "/");
+    }
+    bool digits = !token.empty() && (token.size() == 1 || token[0] != '0') &&
+                  token.size() <= 18;
+    size_t k = 0;
+    for (char ch : token) {
+      digits = digits && ch >= '0' && ch <= '9';
+      k = k * 10 + size_t(ch - '0');
+    }
+    PyObject *name = PyUnicode_FromStringAndSize(token.data(), Py_ssize_t(token.size()));
+    if (name == nullptr) {
+      return false;
+    }
+    path.push_back(FieldStep{std::move(token), digits ? k : SIZE_MAX, name});
+  }
+  return true;
+}
+
+// The fields of `spec` (a JSON Pointer, or a list or tuple of them), or
+// nullptr with an exception.
+Fields *compile_fields(PyObject *spec, PyObject *dflt) {
+  Fields *f = new (std::nothrow) Fields();
+  if (f == nullptr) {
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  f->dflt = Py_NewRef(dflt != nullptr ? dflt : Py_None);
+  f->single = PyUnicode_Check(spec);
+  PyObject *seq = f->single ? PyTuple_Pack(1, spec)
+                  : PyList_Check(spec) || PyTuple_Check(spec)
+                      ? PySequence_Tuple(spec)
+                      : nullptr;
+  if (seq == nullptr) {
+    if (!PyErr_Occurred()) {
+      PyErr_Format(PyExc_TypeError,
+                   "fields must be a JSON pointer (str) or a list or tuple of them, not %.200s",
+                   Py_TYPE(spec)->tp_name);
+    }
+    delete f;
+    return nullptr;
+  }
+  for (Py_ssize_t n = 0; n < PyTuple_GET_SIZE(seq); n++) {
+    f->paths.emplace_back();
+    if (!compile_pointer(PyTuple_GET_ITEM(seq, n), f->paths.back())) {
+      Py_DECREF(seq);
+      delete f;
+      return nullptr;
+    }
+    const std::vector<FieldStep> &path = f->paths.back();
+    size_t common = 0;
+    if (n > 0) {
+      const std::vector<FieldStep> &prev = f->paths[size_t(n) - 1];
+      while (common < path.size() && common < prev.size() &&
+             path[common].key == prev[common].key) {
+        common++;
+      }
+    }
+    f->shared.push_back(common);
+    f->depth = std::max(f->depth, path.size());
+  }
+  Py_DECREF(seq);
+  return f;
+}
+
+// The fields of the document on the tape (root at index 1).
+PyObject *extract_fields(const document &doc, const Fields &f) {
+  const uint64_t *tape = doc.tape.get();
+  const uint8_t *strings = doc.string_buf.get();
+  Builder b(doc);
+  size_t n = f.paths.size();
+  PyObject *tuple = f.single ? nullptr : PyTuple_New(Py_ssize_t(n));
+  if (!f.single && tuple == nullptr) {
+    return nullptr;
+  }
+  // pos[d]: tape index reached after d steps of the previous path, which
+  // reached `reached` steps; paths that share a prefix walk it once.
+  size_t stack[16];
+  std::vector<size_t> heap;
+  size_t *pos = stack;
+  if (f.depth + 1 > 16) {
+    heap.resize(f.depth + 1);
+    pos = heap.data();
+  }
+  pos[0] = 1;
+  size_t reached = 0;
+  for (size_t p = 0; p < n; p++) {
+    const std::vector<FieldStep> &path = f.paths[p];
+    size_t d = std::min(f.shared[p], reached);
+    size_t i = pos[d];
+    for (; d < path.size(); d++) {
+      uint8_t type = uint8_t(tape[i] >> 56);
+      const FieldStep &s = path[d];
+      if (type == '{') {
+        i = find_key_in(tape, strings, i, s.key.data(), s.key.size());
+      } else if (type == '[' && s.index != SIZE_MAX) {
+        i = walk_to(tape, i + 1, 0, s.index, close_of(tape, i));
+      } else {
+        i = 0;
+      }
+      if (i == 0) {
+        break;
+      }
+      pos[d + 1] = i;
+    }
+    reached = d;
+    PyObject *v;
+    if (d == path.size()) {
+      v = b.build(i);
+      if (v == nullptr) {
+        Py_XDECREF(tuple);
+        return nullptr;
+      }
+    } else {
+      v = Py_NewRef(f.dflt);
+    }
+    if (f.single) {
+      return v;
+    }
+    PyTuple_SET_ITEM(tuple, Py_ssize_t(p), v);
+  }
+  return tuple;
+}
+
+PyObject *extract_fields_gc_paused(const document &doc, const Fields &f) {
+#ifndef Py_GIL_DISABLED
+  int gc_was_enabled = PyGC_Disable();
+#endif
+  PyObject *res = extract_fields(doc, f);
+#ifndef Py_GIL_DISABLED
+  if (gc_was_enabled) {
+    PyGC_Enable();
+  }
+#endif
+  return res;
+}
+
+// The fields of a document that json decoded into Python objects.
+PyObject *extract_fields_py(PyObject *value, const Fields &f) {
+  size_t n = f.paths.size();
+  PyObject *tuple = f.single ? nullptr : PyTuple_New(Py_ssize_t(n));
+  if (!f.single && tuple == nullptr) {
+    return nullptr;
+  }
+  for (size_t p = 0; p < n; p++) {
+    PyObject *v = value; // borrowed
+    for (const FieldStep &s : f.paths[p]) {
+      if (PyDict_Check(v)) {
+        v = PyDict_GetItemWithError(v, s.name);
+        if (v == nullptr && PyErr_Occurred()) {
+          Py_XDECREF(tuple);
+          return nullptr;
+        }
+      } else if (PyList_Check(v) && s.index != SIZE_MAX &&
+                 s.index < size_t(PyList_GET_SIZE(v))) {
+        v = PyList_GET_ITEM(v, Py_ssize_t(s.index));
+      } else {
+        v = nullptr;
+      }
+      if (v == nullptr) {
+        break;
+      }
+    }
+    v = Py_NewRef(v != nullptr ? v : f.dflt);
+    if (f.single) {
+      return v;
+    }
+    PyTuple_SET_ITEM(tuple, Py_ssize_t(p), v);
+  }
+  return tuple;
 }
 
 // --- Document ---------------------------------------------------------------
@@ -3102,6 +3334,8 @@ struct StreamObject {
   bool no_fallback;   // a chunk of a parallel run: do not call json (see run_chunk)
   bool need_fallback; // set instead of calling json, with no_fallback
   bool borrowed_parser; // p is this thread's chunk parser (not deleted)
+  Fields *fields;       // fields=: the values at these pointers, not the documents
+  bool owns_fields;     // false in the chunks of a parallel run
   parser *p;
   document_stream *stream;
   document_stream::iterator it;
@@ -3266,6 +3500,9 @@ void free_copy(document *d) {
 }
 
 PyObject *stream_value(StreamObject *s) {
+  if (s->fields != nullptr) {
+    return extract_fields_gc_paused(s->p->doc, *s->fields);
+  }
   if (!s->lazy) {
     return build_with_gc_paused(s->p->doc, 1);
   }
@@ -3313,6 +3550,11 @@ PyObject *stream_fallback(StreamObject *s) {
     return nullptr;
   }
   s->active = false; // resume with simdjson after this document
+  if (s->fields != nullptr) {
+    PyObject *v = extract_fields_py(value, *s->fields);
+    Py_DECREF(value);
+    return v;
+  }
   // As with parse(), a document that only json accepts is returned as plain
   // Python objects.
   return value;
@@ -3386,6 +3628,9 @@ void stream_dealloc(PyObject *self) {
     g_thread_parser.chunk_parser_busy = false;
   } else {
     delete s->p;
+  }
+  if (s->owns_fields) {
+    delete s->fields;
   }
   delete s->copy;
   Py_XDECREF(s->source);
@@ -3474,6 +3719,8 @@ PyObject *make_stream(PyObject *args, PyObject *kwargs, bool lazy) {
   s->base = 0;
   s->last_end = 0;
   s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  s->fields = nullptr;
+  s->owns_fields = false;
   PyObject *self = reinterpret_cast<PyObject *>(s);
   if (must_copy) {
     PyObject *b = PyBytes_FromObject(data);
@@ -3574,6 +3821,8 @@ StreamObject *stream_over(StreamObject *whole, size_t from, size_t to, bool chun
   s->open = whole->open;
   s->close = whole->close;
   s->no_fallback = s->need_fallback = s->borrowed_parser = false;
+  s->fields = whole->fields; // whole outlives its chunks
+  s->owns_fields = false;
   if (chunk && !g_thread_parser.chunk_parser_busy) {
     if (g_thread_parser.chunk_parser == nullptr) {
       register_thread_cleanup();
@@ -4011,20 +4260,66 @@ PyObject *take_threads(PyObject *kwargs, Py_ssize_t *threads, bool *given) {
   return rest;
 }
 
+// Removes the keyword `name` from the dict kwargs (may be nullptr); returns
+// its value (new reference), or nullptr when absent or on error.
+PyObject *pop_keyword(PyObject *kwargs, const char *name) {
+  if (kwargs == nullptr) {
+    return nullptr;
+  }
+  PyObject *v = PyDict_GetItemString(kwargs, name); // borrowed
+  if (v == nullptr) {
+    return nullptr;
+  }
+  Py_INCREF(v);
+  if (PyDict_DelItemString(kwargs, name) < 0) {
+    Py_DECREF(v);
+    return nullptr;
+  }
+  return v;
+}
+
 // The stream for loads_many/parse_many/map_many; with threads, the list of
-// all results instead.
+// all results instead. With fields (not for parse_many), the values at the
+// fields' pointers come instead of the documents.
 PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *fn,
-                         bool force_list) {
+                         bool force_list, bool allow_fields) {
   Py_ssize_t threads;
   bool given;
   PyObject *rest = take_threads(kwargs, &threads, &given);
   if (rest == nullptr && PyErr_Occurred()) {
     return nullptr;
   }
+  Fields *fields = nullptr;
+  if (allow_fields) {
+    PyObject *spec = pop_keyword(rest, "fields");
+    PyObject *dflt = PyErr_Occurred() ? nullptr : pop_keyword(rest, "default");
+    if (PyErr_Occurred()) {
+      // reported below
+    } else if (spec != nullptr && spec != Py_None) {
+      if (lazy) {
+        PyErr_SetString(PyExc_ValueError, "fields cannot be combined with lazy=True");
+      } else {
+        fields = compile_fields(spec, dflt);
+      }
+    } else if (dflt != nullptr) {
+      PyErr_SetString(PyExc_TypeError, "default requires fields");
+    }
+    Py_XDECREF(spec);
+    Py_XDECREF(dflt);
+    if (PyErr_Occurred()) {
+      Py_XDECREF(rest);
+      return nullptr;
+    }
+  }
   PyObject *self = make_stream(args, rest, lazy);
   Py_XDECREF(rest);
   if (self == nullptr) {
+    delete fields;
     return nullptr;
+  }
+  if (fields != nullptr) {
+    reinterpret_cast<StreamObject *>(self)->fields = fields;
+    reinterpret_cast<StreamObject *>(self)->owns_fields = true;
   }
   if (!given && !force_list) {
     return self;
@@ -4045,16 +4340,16 @@ PyObject *stream_or_list(PyObject *args, PyObject *kwargs, bool lazy, PyObject *
 }
 
 PyObject *loads_many(PyObject *, PyObject *args, PyObject *kwargs) {
-  return stream_or_list(args, kwargs, false, nullptr, false);
+  return stream_or_list(args, kwargs, false, nullptr, false, true);
 }
 
 PyObject *parse_many(PyObject *, PyObject *args, PyObject *kwargs) {
-  return stream_or_list(args, kwargs, true, nullptr, false);
+  return stream_or_list(args, kwargs, true, nullptr, false, false);
 }
 
-// map_many(fn, data, *, format, batch_size, threads, lazy=False): [fn(doc) for
-// doc in loads_many(data)] (parse_many with lazy=True), with fn called in the
-// threads.
+// map_many(fn, data, *, format, batch_size, threads, lazy=False, fields,
+// default): [fn(doc) for doc in loads_many(data)] (parse_many with
+// lazy=True), with fn called in the threads.
 PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
   if (PyTuple_GET_SIZE(args) < 1) {
     PyErr_SetString(PyExc_TypeError, "map_many() missing required argument 'fn'");
@@ -4086,7 +4381,7 @@ PyObject *map_many(PyObject *, PyObject *args, PyObject *kwargs) {
     Py_XDECREF(rest);
     return nullptr;
   }
-  PyObject *r = stream_or_list(tail, rest, lazy, fn, true);
+  PyObject *r = stream_or_list(tail, rest, lazy, fn, true, true);
   Py_DECREF(tail);
   Py_XDECREF(rest);
   return r;

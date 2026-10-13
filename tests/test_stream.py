@@ -381,3 +381,104 @@ def test_map_many_lazy_views_kept():
         with pytest.raises(ValueError) as info:
             fastsimdjson.map_many(boom, data, threads=threads, lazy=True)
         assert to_py(info.value.args[0]) == expected[20000]
+
+
+# fields=: the values at JSON Pointers instead of the documents.
+
+_MISSING = object()
+
+
+def _pointer_get(doc, pointer, default=None):
+    if pointer == "":
+        return doc
+    for token in pointer[1:].split("/"):
+        token = token.replace("~1", "/").replace("~0", "~")
+        if isinstance(doc, dict) and token in doc:
+            doc = doc[token]
+        elif (isinstance(doc, list) and token.isdigit() and (token == "0" or token[0] != "0")
+              and int(token) < len(doc)):
+            doc = doc[int(token)]
+        else:
+            return default
+    return doc
+
+
+def _pointers(doc, prefix=""):
+    yield prefix
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            yield from _pointers(v, prefix + "/" + k.replace("~", "~0").replace("/", "~1"))
+    elif isinstance(doc, list):
+        for i, v in enumerate(doc):
+            yield from _pointers(v, f"{prefix}/{i}")
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_fields_random(seed):
+    rnd = random.Random(seed)
+    docs = [random_value(rnd) for _ in range(40)]
+    docs += [{"a/b": {"~": [1, {"k1": 2}]}, "": 3, "07": 4}, ["x", ["y"]]]
+    candidates = sorted({p for d in docs for p in _pointers(d)})
+    candidates += ["/nope", "/k1/nope", "/0/0/0", "/00", "/-", "/1x", "/a~1b/~0/1/k1", "/", "/07"]
+    text = ndjson(docs).encode()
+    for _ in range(10):
+        pointers = rnd.sample(candidates, min(len(candidates), rnd.randrange(1, 8)))
+        if rnd.random() < 0.5:
+            pointers.sort()  # shared prefixes, one after the other
+        got = list(fastsimdjson.loads_many(text, fields=pointers))
+        assert len(got) == len(docs)
+        for g, d in zip(got, docs):
+            assert isinstance(g, tuple)
+            assert all(same(a, _pointer_get(d, p)) for a, p in zip(g, pointers))
+        one = pointers[0]
+        got = list(fastsimdjson.loads_many(text, fields=one, default=_MISSING))
+        assert all(same(a, _pointer_get(d, one, _MISSING)) for a, d in zip(got, docs))
+        assert fastsimdjson.map_many(lambda t: t, text, fields=tuple(pointers)) == \
+            list(fastsimdjson.loads_many(text, fields=pointers))
+
+
+def test_fields_api():
+    data = b'{"a": 1, "b": {"c": [10, 20, {"d": "x"}]}}\n{"a": null}\n[5]\n7\n'
+    assert list(fastsimdjson.loads_many(data, fields=["/a", "/b/c/2/d", "/b/c/2", "/0"])) == [
+        (1, "x", {"d": "x"}, None), (None, None, None, None), (None, None, None, 5),
+        (None, None, None, None)]
+    # A missing field gets the default; null is a value.
+    assert list(fastsimdjson.loads_many(data, fields="/a", default=0)) == [1, None, 0, 0]
+    assert list(fastsimdjson.loads_many(data, fields="")) == list(fastsimdjson.loads_many(data))
+    assert list(fastsimdjson.loads_many(data, fields=[])) == [(), (), (), ()]
+    assert list(fastsimdjson.loads_many(data, fields=None)) == list(fastsimdjson.loads_many(data))
+    # Duplicate keys: the first one, as for views (at_pointer).
+    assert list(fastsimdjson.loads_many(b'{"a": 1, "a": 2}', fields="/a")) == [1]
+    # Documents that only json accepts.
+    assert list(fastsimdjson.loads_many(b'{"a": 1e400, "b": [1]}\n{"a": 2}',
+                                        fields=["/a", "/b/0"])) == [(float("inf"), 1), (2, None)]
+    for bad in ["a", "/~2", "/~"]:
+        with pytest.raises(ValueError):
+            fastsimdjson.loads_many(data, fields=bad)
+    for bad in [1, ["/a", 2], {"/a"}]:
+        with pytest.raises(TypeError):
+            fastsimdjson.loads_many(data, fields=bad)
+    with pytest.raises(ValueError):
+        fastsimdjson.map_many(len, data, fields="/a", lazy=True)
+    with pytest.raises(TypeError):
+        fastsimdjson.loads_many(data, default=1)
+    with pytest.raises(TypeError):
+        fastsimdjson.parse_many(data, fields="/a")
+    with pytest.raises(fastsimdjson.JSONDecodeError):
+        list(fastsimdjson.loads_many(b'{"a": 1}\n{"a": ', fields="/a"))
+
+
+@pytest.mark.parametrize("fmt", ["whitespace", "lines", "json_seq"])
+@pytest.mark.parametrize("seed", range(6))
+def test_fields_threads(fmt, seed):
+    data = _threaded_input(seed, fmt)
+    pointers = ["/i", "/s", "/big", "/0", "/pretty/1", "/f"]
+    expected = _outcome(lambda: list(fastsimdjson.loads_many(data, format=fmt, fields=pointers)))
+    if expected[0] == "ok":
+        docs = list(fastsimdjson.loads_many(data, format=fmt))
+        assert expected[1] == [tuple(_pointer_get(d, p) for p in pointers) for d in docs]
+    for threads in (None, 1, 4):
+        assert _outcome(lambda: fastsimdjson.loads_many(data, format=fmt, fields=pointers,
+                                                        threads=threads)) == expected
+        assert _outcome(lambda: fastsimdjson.map_many(lambda t: t, data, format=fmt,
+                                                      fields=pointers, threads=threads)) == expected

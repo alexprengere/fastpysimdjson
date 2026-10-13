@@ -7,7 +7,8 @@ replacement for the `json` module's `loads`, `load`, `dumps` and `dump`, and
 it can be over 3 times faster than the standard `json.loads` and
 `json.dumps`. When you only need part of a document, its lazy `parse`
 function is faster still. It also reads streams of documents (NDJSON, JSON
-Lines). It writes JSON in two ways: `dumps` returns the same `str` as
+Lines), on many threads with free-threaded Python, and can extract only the
+fields you need from each document. It writes JSON in two ways: `dumps` returns the same `str` as
 `json.dumps`, and `dumpb` returns the same `bytes` as `orjson.dumps`, as fast
 as orjson.
 
@@ -202,6 +203,37 @@ document, and the Python objects of all of them, to the calling thread.
 With the GIL (the default build of Python), the calling thread does all the
 work: `threads` has no effect on speed.
 
+### Only some fields: `fields=`
+
+When you need a few values from each document, `fields` extracts them
+without building the documents: only the values found become Python
+objects.
+
+```python
+events = fastsimdjson.loads_many(data, fields=["/type", "/payload/action"])
+# (type, action) for each document
+
+def count(t):
+    kind, action, language = t
+    ...
+fastsimdjson.map_many(count, data, threads=64,
+                      fields=["/type", "/payload/action",
+                              "/payload/pull_request/base/repo/language"])
+```
+
+`loads_many` and `map_many` accept `fields`: a JSON Pointer (RFC 6901), or a
+list or tuple of them. Each document then becomes the value at the pointer,
+or a tuple of the values at the pointers, in order. A value that is an
+object or an array is built in full. A pointer that leads nowhere (a
+missing key, an index past the end, or a step into a scalar) gives
+`default`, `None` unless you pass another value; a JSON `null` gives `None`.
+As with `at_pointer`, a key that appears twice in an object refers to its
+first occurrence. `fields` cannot be combined with `lazy=True`.
+
+On 7.6 GB of GitHub events, `map_many` with three fields ran at 2.8 GB/s on
+one core of an Intel Xeon Gold 6548N, against 2.2 GB/s with lazy views
+(`lazy=True`). With 64 threads, it ran at 78 GB/s (lazy views: 61 GB/s).
+
 ### `release`
 
 `release()` frees the simdjson parser and the string caches kept by the
@@ -276,8 +308,8 @@ The suite builds an ~80 MB document and a list of 16,777,221 integers, so
 give it some RAM.
 
 The benchmark scripts need simdjson-data and the `bench` extra (orjson,
-msgspec, pysimdjson, cysimdjson). `bench.py` times `loads` against
-`json.loads` and orjson, `bench_lazy.py` times `parse` against pysimdjson and
+jiter, msgspec, pysimdjson, cysimdjson). `bench.py` times `loads` against
+`json.loads`, orjson and jiter, `bench_lazy.py` times `parse` against pysimdjson and
 cysimdjson, `bench_dumps.py` times `dumps` against `json.dumps` and `dumpb`
 against orjson and msgspec, and `bench_many.py` times `loads_many`.
 
@@ -316,7 +348,7 @@ geometric mean over the 22 files (higher is better).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads_dark.png">
-  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads.png" width="80%" alt="Parsing JSON in Python: fastsimdjson loads 0.78 GB/s, orjson 0.60, msgspec 0.53, pysimdjson 0.44, cysimdjson 0.43, ujson 0.37, python-rapidjson 0.24, simplejson 0.23, json 0.22">
+  <img src="https://raw.githubusercontent.com/simdjson/fastpysimdjson/main/doc/perf_loads.png" width="80%" alt="Parsing JSON in Python: fastsimdjson loads 0.78 GB/s, orjson 0.60, msgspec 0.53, jiter 0.48, pysimdjson 0.44, cysimdjson 0.43, ujson 0.37, python-rapidjson 0.24, simplejson 0.23, json 0.22">
 </picture>
 
 | parser | GB/s | vs `json.loads` |
@@ -327,6 +359,7 @@ geometric mean over the 22 files (higher is better).
 | ujson 6.0.0 | 0.37 | 1.66× |
 | cysimdjson 26.27 | 0.43 | 1.96× |
 | pysimdjson 7.0.2 | 0.44 | 1.98× |
+| jiter 0.17.0 | 0.48 | 2.21× |
 | msgspec 0.22.0 | 0.53 | 2.42× |
 | orjson 3.12.0 | 0.60 | 2.74× |
 | **fastsimdjson `loads`** | **0.78** | **3.53×** |
@@ -340,7 +373,9 @@ gain comes from pausing the garbage collector while the objects are built.
 Timing each call on its own, fastsimdjson's lead over orjson is 1.33× with
 the collector enabled and 1.22× with it disabled (geometric means); without
 the collector, `canada.json`, `mesh.json` and `numbers.json` are ties. yyjson 4.0.6 is left out: it
-returns wrong strings for non-ASCII text.
+returns wrong strings for non-ASCII text. jiter (the parser of pydantic)
+caches strings by default; turning the cache off (`cache_mode=False`) makes it
+slower here (0.44 GB/s).
 
 Parsing is no longer the bottleneck. simdjson alone parses these files at
 3.1 GB/s. It accounts for about a third of the time of `loads`; the rest goes
